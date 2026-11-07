@@ -1,0 +1,260 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Media Only — Tumblr Feed (Fast)</title>
+<style>
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; }
+
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    background: #fafafa;
+    color: #262626;
+    min-height: 100vh;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+  }
+
+  .feed {
+    width: 100%;
+    max-width: 470px;
+    margin: 0 auto;
+    padding: 16px 12px 64px;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 16px;
+  }
+
+  .media {
+    width: 100%;
+    height: auto;
+    display: block;
+    border-radius: 10px;
+    background: #eee;
+  }
+  video.media { background: #000; }
+
+  .skeleton {
+    width: 100%;
+    aspect-ratio: 4 / 5;
+    border-radius: 10px;
+    background: linear-gradient(100deg, #eee 30%, #f5f5f5 50%, #eee 70%);
+    background-size: 200% 100%;
+    animation: shimmer 1.2s infinite linear;
+  }
+  @keyframes shimmer {
+    from { background-position: 200% 0; }
+    to   { background-position: -200% 0; }
+  }
+
+  .error {
+    width: 100%;
+    padding: 24px;
+    border-radius: 10px;
+    background: #fdecec;
+    color: #c0392b;
+    font-size: 13px;
+    text-align: center;
+  }
+</style>
+</head>
+<body>
+
+<main class="feed" id="feed"></main>
+
+<script>
+/* ---------- all 42 post IDs ---------- */
+const POST_IDS = [
+  "803607528659419136","803607441484972032","803607389814276096","803607271098712064",
+  "803607253561344000","799046317859127296","797777851305836544","797687205002919936",
+  "797684266959011840","797684179091554304","797482624466747392","797482506491396096",
+  "794452244117520384","794451555342581760","794451540768440320","794451027836518400",
+  "794450836354924544",
+  "794341704868167680","794327721471819776","793973144363958272","793973087664275456",
+  "793912648495513600","793075570484330496","792906636421365760","792598508335251456",
+  "792523374210564096","792523180040454145","792417273959825408","792417190106267648",
+  "790453627602042880","788704905280077824","787088256840925184",
+  "787088220946071552","787086197476474880","785841737614622720","785258008998543360",
+  "785007787646320640","784757156411998208","784630325145927680","784575143687127040",
+  "784473791578374144","784473768896692225"
+];
+
+/* ---------- cache ---------- */
+const CACHE_KEY = "tg-media-cache-v3";
+let cache = {};
+try { cache = JSON.parse(localStorage.getItem(CACHE_KEY) || "{}"); } catch (_) {}
+
+let saveScheduled = false;
+function saveCache() {
+  if (saveScheduled) return;
+  saveScheduled = true;
+  setTimeout(() => {
+    saveScheduled = false;
+    try { localStorage.setItem(CACHE_KEY, JSON.stringify(cache)); } catch (_) {}
+  }, 300);
+}
+
+/* ---------- proxies ---------- */
+const PROXIES = [
+  u => `https://corsproxy.io/?${encodeURIComponent(u)}`,
+  u => `https://api.allorigins.win/raw?url=${encodeURIComponent(u)}`,
+  u => `https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(u)}`
+];
+let preferredProxy = 0;
+
+async function fetchText(url) {
+  const order = [preferredProxy, ...PROXIES.map((_, i) => i).filter(i => i !== preferredProxy)];
+  let lastErr;
+  for (const i of order) {
+    try {
+      const r = await fetch(PROXIES[i](url));
+      if (!r.ok) throw new Error("HTTP " + r.status);
+      const text = await r.text();
+      preferredProxy = i;          // stick with this one
+      return text;
+    } catch (e) { lastErr = e; }
+  }
+  throw lastErr;
+}
+
+/* ---------- extract direct media URLs ---------- */
+function extractMedia(html) {
+  const h = html.replace(/\\\//g, "/").replace(/&amp;/g, "&");
+  const re = /https:\/\/[a-z0-9]+\.media\.tumblr\.com\/[^\s"'<>\\]+/gi;
+
+  const seenUrls = new Set();
+  const seenBases = new Set();
+  const images = [];
+  const videos = [];
+  let m;
+
+  while ((m = re.exec(h))) {
+    let url = m[0].replace(/[),.]+$/, "");
+    if (seenUrls.has(url)) continue;
+    seenUrls.add(url);
+    if (/\/avatar_|\/favicon|\/icon|\/blank|_1x1/i.test(url)) continue;
+
+    const isVideo = /\.(mp4|webm)(\?|$)/i.test(url);
+    const isImage = /\.(jpe?g|png|gif|webp)(\?|$)/i.test(url);
+    if (!isVideo && !isImage) continue;
+
+    const base = (url.match(/(tumblr_[a-z0-9]+)_/i) || [url])[0];
+    if (seenBases.has(base)) continue;
+    seenBases.add(base);
+
+    (isVideo ? videos : images).push(url);
+  }
+  return { images, videos };
+}
+
+/* ---------- fetch a single post's media ---------- */
+async function loadPostMedia(id) {
+  if (cache[id] && (cache[id].images?.length || cache[id].videos?.length)) return cache[id];
+
+  // try AMP first (smallest), then post page, then embed
+  const urls = [
+    `https://super-gilf.tumblr.com/post/${id}/amp`,
+    `https://super-gilf.tumblr.com/post/${id}`,
+    `https://embed.tumblr.com/embed/post/super-gilf/${id}`
+  ];
+
+  for (const url of urls) {
+    try {
+      const html = await fetchText(url);
+      const media = extractMedia(html);
+      if (media.images.length || media.videos.length) {
+        cache[id] = media;
+        saveCache();
+        return media;
+      }
+    } catch (_) { /* try next */ }
+  }
+  return null;
+}
+
+/* ---------- render ---------- */
+const feed = document.getElementById("feed");
+const nodes = new Map();   // id -> wrapper element
+
+function buildMediaEls(media) {
+  const items = media.videos.length ? media.videos : media.images;
+  return items.map(src => {
+    const isVideo = /\.(mp4|webm)(\?|$)/i.test(src);
+    let el;
+    if (isVideo) {
+      el = document.createElement("video");
+      el.src = src;
+      el.controls = true;
+      el.playsInline = true;
+      el.preload = "metadata";
+      el.muted = true;
+      el.loop = true;
+    } else {
+      el = document.createElement("img");
+      el.src = src;
+      el.loading = "lazy";
+      el.alt = "";
+    }
+    el.className = "media";
+    return el;
+  });
+}
+
+function renderInto(wrap, media) {
+  wrap.innerHTML = "";
+  if (!media) {
+    const err = document.createElement("div");
+    err.className = "error";
+    err.textContent = "Could not load media";
+    wrap.appendChild(err);
+    return;
+  }
+  buildMediaEls(media).forEach(el => wrap.appendChild(el));
+}
+
+async function hydrate(id) {
+  const wrap = nodes.get(id);
+  if (!wrap || wrap.dataset.loaded === "1") return;
+  wrap.dataset.loaded = "1";
+
+  const media = await loadPostMedia(id);
+  renderInto(wrap, media);
+}
+
+/* build skeleton for every post up front */
+POST_IDS.forEach(id => {
+  const wrap = document.createElement("div");
+  wrap.style.width = "100%";
+  wrap.dataset.id = id;
+
+  if (cache[id] && (cache[id].images?.length || cache[id].videos?.length)) {
+    renderInto(wrap, cache[id]);
+    wrap.dataset.loaded = "1";
+  } else {
+    const sk = document.createElement("div");
+    sk.className = "skeleton";
+    wrap.appendChild(sk);
+  }
+
+  feed.appendChild(wrap);
+  nodes.set(id, wrap);
+});
+
+/* only fetch when within 600px of viewport */
+const observer = new IntersectionObserver(entries => {
+  entries.forEach(e => {
+    if (e.isIntersecting) {
+      observer.unobserve(e.target);
+      hydrate(e.target.dataset.id);
+    }
+  });
+}, { rootMargin: "600px 0px" });
+
+nodes.forEach(wrap => observer.observe(wrap));
+</script>
+</body>
+</html>
